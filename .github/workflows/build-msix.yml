@@ -1,0 +1,122 @@
+name: Build private Photo Triage MSIX
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: photo-triage-msix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and sign Windows MSIX
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements-windows.txt
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-windows.txt
+
+      - name: Validate Python source
+        shell: pwsh
+        run: python -m py_compile photo_triage_app_2_refactored.py
+
+      - name: Build windowed application
+        shell: pwsh
+        run: |
+          Remove-Item build -Recurse -Force -ErrorAction SilentlyContinue
+          python -m PyInstaller --noconfirm --clean --onedir --windowed `
+            --name PhotoTriage `
+            --distpath build `
+            --workpath build\pyinstaller-work `
+            --specpath build `
+            photo_triage_app_2_refactored.py
+
+      - name: Create temporary private test certificate
+        shell: pwsh
+        env:
+          CERT_SUBJECT: 'CN=Photo Triage Private Beta'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $certDir = Join-Path $PWD 'build\certificate'
+          New-Item -ItemType Directory -Force -Path $certDir | Out-Null
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject $env:CERT_SUBJECT `
+            -CertStoreLocation 'Cert:\CurrentUser\My' `
+            -NotAfter (Get-Date).AddYears(1) `
+            -HashAlgorithm SHA256
+          $passwordPlain = (New-Guid).Guid
+          $password = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+          Export-PfxCertificate `
+            -Cert $cert `
+            -FilePath (Join-Path $certDir 'PhotoTriage-TestCert.pfx') `
+            -Password $password | Out-Null
+          Export-Certificate `
+            -Cert $cert `
+            -FilePath (Join-Path $certDir 'PhotoTriage-TestCert.cer') `
+            -Type CERT | Out-Null
+          Set-Content -Path (Join-Path $certDir 'pfx-password.txt') -Value $passwordPlain -NoNewline
+
+      - name: Package and sign MSIX
+        shell: pwsh
+        env:
+          GITHUB_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = "1.0.$env:GITHUB_RUN_NUMBER.0"
+          $payload = Join-Path $PWD 'build\msix-payload'
+          $msix = Join-Path $PWD "build\PhotoTriage-$version.msix"
+          $pfx = Join-Path $PWD 'build\certificate\PhotoTriage-TestCert.pfx'
+          $passwordText = Get-Content (Join-Path $PWD 'build\certificate\pfx-password.txt') -Raw
+
+          New-Item -ItemType Directory -Force -Path $payload | Out-Null
+          Copy-Item 'build\PhotoTriage\*' $payload -Recurse -Force
+          Copy-Item 'AppxManifest.xml' $payload -Force
+          Copy-Item 'assets' $payload -Recurse -Force
+
+          $manifestPath = Join-Path $payload 'AppxManifest.xml'
+          $manifest = Get-Content $manifestPath -Raw
+          $manifest = $manifest -replace 'Version="[^"]+"', ('Version="' + $version + '"')
+          Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
+
+          $makeAppx = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName | Select-Object -Last 1
+          $signTool = Get-ChildItem "$env:ProgramFiles(x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
+          if (-not $makeAppx -or -not $signTool) { throw 'Windows SDK packaging tools were not found.' }
+
+          & $makeAppx.FullName pack /d $payload /p $msix /o
+          if ($LASTEXITCODE -ne 0) { throw 'MakeAppx failed.' }
+
+          & $signTool.FullName sign /fd SHA256 /f $pfx /p $passwordText /tr http://timestamp.digicert.com /td SHA256 $msix
+          if ($LASTEXITCODE -ne 0) { throw 'SignTool failed.' }
+
+          Get-FileHash $msix -Algorithm SHA256 | Format-List
+          Remove-Item $pfx -Force
+          Remove-Item (Join-Path $PWD 'build\certificate\pfx-password.txt') -Force
+
+      - name: Upload signed MSIX and certificate
+        uses: actions/upload-artifact@v4
+        with:
+          name: photo-triage-msix-${{ github.run_number }}
+          path: |
+            build/*.msix
+            build/certificate/PhotoTriage-TestCert.cer
+          if-no-files-found: error
+          retention-days: 30
