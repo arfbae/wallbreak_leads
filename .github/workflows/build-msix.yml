@@ -94,8 +94,7 @@ jobs:
 
           $manifestPath = Join-Path $payload 'AppxManifest.xml'
           $manifest = Get-Content $manifestPath -Raw
-          $manifest = $manifest -replace 'Version="[^"]+"', ('Version="' + $version + '"')
-          Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
+          $manifest = $manifest -creplace 'Version="[^"]+"', ('Version="' + $version + '"')          Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
 
           $makeAppx = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" | Sort-Object FullName | Select-Object -Last 1
           $signTool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName | Select-Object -Last 1
